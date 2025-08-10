@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+.env
+.env.*
+tg_session*
+.venv/
