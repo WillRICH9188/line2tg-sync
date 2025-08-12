@@ -18,9 +18,8 @@ API_HASH = os.environ.get("API_HASH", "")
 TELEGRAM_STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION", "")
 TG_TARGET = os.environ.get("TG_TARGET", "")  # @username 或 -100xxxxxxxxxx
 
-# 影片下方按钮（可选）
-BTN_TEXT = os.environ.get("BTN_TEXT", "Join now").strip()  # 例：立即加入
-BTN_URL = os.environ.get("BTN_URL", "https://teenpatti.game/share/index.html?i=12633727&c=TeenpattigameGG01&e=pro&s=c").strip()    # 例：https://your.site/
+# 可选：在视频下方显示的网址（作为 caption）
+BTN_URL = os.environ.get("BTN_URL", "").strip()
 
 if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and API_ID and API_HASH and TELEGRAM_STRING_SESSION and TG_TARGET):
     raise RuntimeError("❌ 必填环境变量缺失：LINE/Telegram(MTProto) 相关配置未填全")
@@ -31,7 +30,6 @@ parser = WebhookParser(LINE_CHANNEL_SECRET)
 
 # Pyrogram 用户客户端（MTProto）
 from pyrogram import Client
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 tg = Client(
     name="line2tg",
@@ -53,6 +51,36 @@ async def _shutdown():
 # （可选）发送普通文本（用户账号）
 async def tg_send_text(text: str):
     await tg.send_message(chat_id=TG_TARGET, text=text)
+
+# ---- 工具函数 ----
+def _ext_from_content_type(ct: str) -> str:
+    """根据 Content-Type 猜扩展名，尽量保留原容器，帮助 TG 正确识别比例"""
+    if not ct:
+        return ".mp4"
+    ct = ct.lower()
+    if "video/mp4" in ct:
+        return ".mp4"
+    if "video/quicktime" in ct or "/mov" in ct:
+        return ".mov"
+    if "video/x-matroska" in ct or "mkv" in ct:
+        return ".mkv"
+    if "video/webm" in ct:
+        return ".webm"
+    return ".mp4"
+
+def _probe_dims(path: str):
+    """用 OpenCV 读取视频宽高，失败则返回 (None, None)"""
+    try:
+        import cv2  # 延迟导入，避免冷启动报错
+        cap = cv2.VideoCapture(path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return None, None
 
 # ----- LINE Webhook -----
 @app.post("/webhook", response_class=PlainTextResponse)
@@ -80,50 +108,57 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
 
 async def handle_binary_message(message_id: str):
     """
-    从 LINE 下载内容 -> 保存到临时 .mp4 -> 始终以 send_video 发送（不走 document）。
-    不显示 caption，只显示一个按钮（若 BTN_URL 非空）。
+    从 LINE 下载内容 -> 保存到临时文件（按 Content-Type 选择扩展名）
+    -> 读取宽高 -> 以 send_video 发送并显式指定 width/height（避免手机端显示成正方形）。
+    caption 仅放 BTN_URL（若为空则不带 caption）。
     """
     start = time.time()
 
-    # 下载 LINE 媒体
+    # 1) 下载 LINE 媒体并获取 Content-Type
     content = line_bot_api.get_message_content(message_id)
+    content_type = ""
+    try:
+        content_type = content.headers.get("Content-Type", "")
+    except Exception:
+        pass
 
-    # 强制使用 .mp4 扩展名（帮助 TG 识别为视频）
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+    suffix = _ext_from_content_type(content_type)
+
+    # 2) 写入临时文件
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
         for chunk in content.iter_content():
             if chunk:
                 tmp.write(chunk)
 
-    size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+    # 3) 读取视频宽高
+    width, height = _probe_dims(tmp_path)
 
-    # 构建按钮（如果配置了 URL）
-    reply_markup = None
+    # 4) 组织参数，caption 只放 URL
+    send_kwargs = {
+        "chat_id": TG_TARGET,
+        "video": tmp_path,
+        "supports_streaming": True,
+    }
     if BTN_URL:
-        text = BTN_TEXT or "Open"
-        reply_markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text, url=BTN_URL)]]
-        )
+        send_kwargs["caption"] = BTN_URL
+    if width and height:
+        send_kwargs["width"] = width
+        send_kwargs["height"] = height
 
-    # 始终用 send_video（可播放），不传 caption
-    await tg.send_video(
-        chat_id=TG_TARGET,
-        video=tmp_path,
-        supports_streaming=True,
-        reply_markup=reply_markup,
-    )
+    # 5) 发送视频
+    await tg.send_video(**send_kwargs)
 
-    # 清理临时文件
+    # 6) 清理
     try:
         os.remove(tmp_path)
     except Exception:
         pass
 
     cost = time.time() - start
-    print(f"✔ synced to TG as VIDEO: {size_mb:.1f}MB, {cost:.1f}s, btn={'on' if BTN_URL else 'off'}")
+    print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', suffix='{suffix}', caption={'on' if BTN_URL else 'off'}")
 
 # 健康检查
 @app.get("/")
 def root():
     return {"ok": True}
-
