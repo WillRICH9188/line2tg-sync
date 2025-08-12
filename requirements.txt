@@ -1,7 +1,7 @@
-# ---- Webhook 转发服务（FastAPI + LINE SDK + Telegram Bot API）----
 fastapi==0.110.0
 uvicorn[standard]==0.23.2
 python-dotenv==1.0.1
 line-bot-sdk==3.11.0
-# 关键：line-bot-sdk 3.11.0 依赖 requests < 2.32
 requests==2.31.0
+pyrogram==2.0.106
+tgcrypto==1.2.5
