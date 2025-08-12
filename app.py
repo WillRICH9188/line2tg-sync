@@ -17,7 +17,10 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 TELEGRAM_STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION", "")
 TG_TARGET = os.environ.get("TG_TARGET", "")  # @username 或 -100xxxxxxxxxx
-CAPTION_PREFIX = os.environ.get("CAPTION_PREFIX", "Happy Channel")
+
+# 影片下方按钮（可选）
+BTN_TEXT = os.environ.get("BTN_TEXT", "").strip()  # 例：立即加入
+BTN_URL = os.environ.get("BTN_URL", "").strip()    # 例：https://your.site/
 
 if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and API_ID and API_HASH and TELEGRAM_STRING_SESSION and TG_TARGET):
     raise RuntimeError("❌ 必填环境变量缺失：LINE/Telegram(MTProto) 相关配置未填全")
@@ -28,6 +31,8 @@ parser = WebhookParser(LINE_CHANNEL_SECRET)
 
 # Pyrogram 用户客户端（MTProto）
 from pyrogram import Client
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 tg = Client(
     name="line2tg",
     api_id=API_ID,
@@ -64,27 +69,26 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
     for event in events:
         if isinstance(event, MessageEvent):
             if isinstance(event.message, VideoMessage):
-                await handle_binary_message(event.message.id, f"{CAPTION_PREFIX} · video (from LINE)")
+                await handle_binary_message(event.message.id)
             elif isinstance(event.message, FileMessage):
-                # 你要求「无论大小都当影片发送」，这里也按影片处理
-                name = event.message.file_name or "video"
-                await handle_binary_message(event.message.id, f"{CAPTION_PREFIX} · {name}")
+                # 你要求「全部当影片发送」，文件也按影片尝试发送
+                await handle_binary_message(event.message.id)
             elif isinstance(event.message, TextMessage):
                 if event.message.text.strip().lower() == "ping":
                     await tg_send_text("pong from LINE webhook")
     return "OK"
 
-async def handle_binary_message(message_id: str, caption: str):
+async def handle_binary_message(message_id: str):
     """
     从 LINE 下载内容 -> 保存到临时 .mp4 -> 始终以 send_video 发送（不走 document）。
-    注意：Telegram 单文件上限 2GB；若源文件并非有效视频容器/编码，TG 可能报错。
+    不显示 caption，只显示一个按钮（若 BTN_URL 非空）。
     """
     start = time.time()
 
     # 下载 LINE 媒体
     content = line_bot_api.get_message_content(message_id)
 
-    # 强制使用 .mp4 扩展名（多数 LINE 视频就是 mp4；扩展名能帮助 TG 识别为视频）
+    # 强制使用 .mp4 扩展名（帮助 TG 识别为视频）
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp_path = tmp.name
         for chunk in content.iter_content():
@@ -92,14 +96,21 @@ async def handle_binary_message(message_id: str, caption: str):
                 tmp.write(chunk)
 
     size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
-    cap = f"{caption}\n(size: {size_mb:.1f}MB)"
 
-    # 始终用 send_video（可播放）。不做 document 兜底。
+    # 构建按钮（如果配置了 URL）
+    reply_markup = None
+    if BTN_URL:
+        text = BTN_TEXT or "Open"
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text, url=BTN_URL)]]
+        )
+
+    # 始终用 send_video（可播放），不传 caption
     await tg.send_video(
         chat_id=TG_TARGET,
         video=tmp_path,
-        caption=cap,
-        supports_streaming=True,  # 提示客户端按流媒体处理
+        supports_streaming=True,
+        reply_markup=reply_markup,
     )
 
     # 清理临时文件
@@ -109,7 +120,7 @@ async def handle_binary_message(message_id: str, caption: str):
         pass
 
     cost = time.time() - start
-    print(f"✔ synced to TG as VIDEO: {size_mb:.1f}MB, {cost:.1f}s")
+    print(f"✔ synced to TG as VIDEO: {size_mb:.1f}MB, {cost:.1f}s, btn={'on' if BTN_URL else 'off'}")
 
 # 健康检查
 @app.get("/")
