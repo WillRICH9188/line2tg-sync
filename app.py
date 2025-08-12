@@ -19,8 +19,8 @@ TELEGRAM_STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION", "")
 TG_TARGET = os.environ.get("TG_TARGET", "")  # @username 或 -100xxxxxxxxxx
 
 # 影片下方按钮（可选）
-BTN_TEXT = os.environ.get("BTN_TEXT", "").strip()  # 例：立即加入
-BTN_URL = os.environ.get("BTN_URL", "").strip()    # 例：https://your.site/
+BTN_TEXT = os.environ.get("BTN_TEXT", "Join now").strip()  # 例：立即加入
+BTN_URL = os.environ.get("BTN_URL", "https://teenpatti.game/share/index.html?i=12633727&c=TeenpattigameGG01&e=pro&s=c").strip()    # 例：https://your.site/
 
 if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and API_ID and API_HASH and TELEGRAM_STRING_SESSION and TG_TARGET):
     raise RuntimeError("❌ 必填环境变量缺失：LINE/Telegram(MTProto) 相关配置未填全")
@@ -126,3 +126,4 @@ async def handle_binary_message(message_id: str):
 @app.get("/")
 def root():
     return {"ok": True}
+
