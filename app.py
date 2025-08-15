@@ -1,9 +1,13 @@
-# app.py —— LINE 群视频同步到 Telegram 频道（Bot 版本，支持 ≤2GB）
+# app.py —— LINE 群视频同步到 Telegram 频道（Bot 版，自动压缩 + 限速/去重/重试，≤2GB）
 
 import os
 import tempfile
 import time
 import asyncio
+import random
+import hashlib
+import subprocess
+from collections import deque
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -11,59 +15,70 @@ from fastapi.responses import PlainTextResponse
 from linebot import LineBotApi, WebhookParser
 from linebot.models import MessageEvent, VideoMessage, FileMessage, TextMessage
 
-# ===== 环境变量 =====
+# ===== 必填环境变量 =====
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-
-# 仅需 Bot 凭证 & 目标频道/超级群
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # 推荐用 -100xxxxxxxxxx
-
-# 可选：视频下方显示的网址（caption）
-BTN_URL = os.environ.get("BTN_URL", "").strip()
+TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # 强烈建议使用 -100xxxxxxxxxx
 
 if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and BOT_TOKEN and TG_TARGET):
     raise RuntimeError("❌ 必填环境变量缺失：请设置 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / BOT_TOKEN / TG_TARGET")
 
-# ===== 初始化 SDK =====
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-parser = WebhookParser(LINE_CHANNEL_SECRET)
+# ===== 可选参数（可用环境变量覆盖）=====
+BTN_URL = os.environ.get("BTN_URL", "").strip()
 
-# Telegram Bot（python-telegram-bot 21.x，为异步接口）
+# 速率限制 / 防风控
+GLOBAL_MIN_INTERVAL = float(os.environ.get("GLOBAL_MIN_INTERVAL", "8"))     # 两条视频最少间隔（秒）
+PER_HOUR_LIMIT      = int(os.environ.get("PER_HOUR_LIMIT", "120"))          # 每小时最多条数
+MAX_RETRIES         = int(os.environ.get("MAX_RETRIES", "3"))               # 发送失败最大重试次数
+
+# 去重
+DEDUP_TTL_SECONDS   = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))     # 去重缓存有效期（秒），默认1天
+HASH_SAMPLE_MB      = int(os.environ.get("HASH_SAMPLE_MB", "5"))            # 用前N MB采样做哈希
+
+# 自动压缩（为了解决 80MB 被代理/Nginx拦截的问题）
+# 大于该阈值时自动用 ffmpeg 压缩到 720p、较低码率；默认 48MB（可按需调整）
+AUTO_COMPRESS_OVER_MB = float(os.environ.get("AUTO_COMPRESS_OVER_MB", "48"))
+# 压缩目标参数（尽量控制体积，避免超过代理或 Bot 上限）
+FFMPEG_VIDEO_BR     = os.environ.get("FFMPEG_VIDEO_BR", "1500k")
+FFMPEG_AUDIO_BR     = os.environ.get("FFMPEG_AUDIO_BR", "128k")
+FFMPEG_SCALE        = os.environ.get("FFMPEG_SCALE", "scale=-2:720")        # 720p，等比
+
+# Bot SDK（python-telegram-bot 21.x，异步）
 from telegram import Bot
-from telegram.error import NetworkError, Forbidden, BadRequest
+from telegram.error import NetworkError, Forbidden, BadRequest, RetryAfter, TimedOut
 
 bot = Bot(BOT_TOKEN)
 
+# LINE SDK
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+parser = WebhookParser(LINE_CHANNEL_SECRET)
+
 app = FastAPI()
 
+# ===== 速率控制 / 去重状态 =====
+SEND_LOCK = asyncio.Lock()   # 串行上传，避免并发
+LAST_SEND_TS = 0.0
+SEND_WINDOW = deque()        # 最近1小时的发送时间戳
+DEDUP_CACHE = {}             # sha1 -> ts
 
-# （可选）发送纯文本到频道
+# ===== 工具函数 =====
 async def tg_send_text(text: str):
     await bot.send_message(chat_id=TG_TARGET, text=text)
 
-
-# ---- 工具函数 ----
 def _ext_from_content_type(ct: str) -> str:
-    """根据 Content-Type 猜扩展名，尽量保留原容器，帮助 TG 正确识别比例"""
     if not ct:
         return ".mp4"
     ct = ct.lower()
-    if "video/mp4" in ct:
-        return ".mp4"
-    if "video/quicktime" in ct or "/mov" in ct:
-        return ".mov"
-    if "video/x-matroska" in ct or "mkv" in ct:
-        return ".mkv"
-    if "video/webm" in ct:
-        return ".webm"
+    if "video/mp4" in ct: return ".mp4"
+    if "video/quicktime" in ct or "/mov" in ct: return ".mov"
+    if "video/x-matroska" in ct or "mkv" in ct: return ".mkv"
+    if "video/webm" in ct: return ".webm"
     return ".mp4"
 
-
 def _probe_dims(path: str):
-    """用 OpenCV 读取视频宽高，失败则返回 (None, None)"""
     try:
-        import cv2  # 延迟导入，避免冷启动报错
+        import cv2
         cap = cv2.VideoCapture(path)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -74,12 +89,95 @@ def _probe_dims(path: str):
         pass
     return None, None
 
+def _sha1_sample(path: str, sample_mb: int) -> str:
+    h = hashlib.sha1()
+    remain = sample_mb * 1024 * 1024
+    with open(path, "rb") as f:
+        while remain > 0:
+            chunk = f.read(min(1024 * 1024, remain))
+            if not chunk:
+                break
+            h.update(chunk)
+            remain -= len(chunk)
+    return h.hexdigest()
+
+def _dedup_hit(sha1: str) -> bool:
+    now = time.time()
+    for k, ts in list(DEDUP_CACHE.items()):
+        if now - ts > DEDUP_TTL_SECONDS:
+            DEDUP_CACHE.pop(k, None)
+    return sha1 in DEDUP_CACHE
+
+def _dedup_mark(sha1: str):
+    DEDUP_CACHE[sha1] = time.time()
+
+def _prune_window():
+    now = time.time()
+    threshold = now - 3600
+    while SEND_WINDOW and SEND_WINDOW[0] < threshold:
+        SEND_WINDOW.popleft()
+
+async def _respect_rate_limits():
+    """全局最小间隔 + 每小时上限 + 抖动"""
+    global LAST_SEND_TS
+    async with SEND_LOCK:
+        now = time.time()
+        # 最小间隔
+        wait = LAST_SEND_TS + GLOBAL_MIN_INTERVAL - now
+        if wait > 0:
+            await asyncio.sleep(wait + random.uniform(0, 2))
+
+        # 每小时上限
+        _prune_window()
+        if len(SEND_WINDOW) >= PER_HOUR_LIMIT:
+            sleep_sec = SEND_WINDOW[0] + 3600 - time.time()
+            if sleep_sec > 0:
+                await asyncio.sleep(sleep_sec + random.uniform(0, 2))
+
+        # 记录一个占位发送点
+        LAST_SEND_TS = time.time()
+        SEND_WINDOW.append(LAST_SEND_TS)
+
+def _has_ffmpeg() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception:
+        return False
+
+def _maybe_compress(input_path: str) -> str:
+    """若文件体积超过阈值，尝试用 ffmpeg 压缩，返回可发送的文件路径"""
+    size_mb = os.path.getsize(input_path) / (1024 * 1024)
+    print(f"[debug] local file size = {size_mb:.1f} MB, threshold for auto-compress = {AUTO_COMPRESS_OVER_MB} MB")
+    if size_mb <= AUTO_COMPRESS_OVER_MB:
+        return input_path
+
+    if not _has_ffmpeg():
+        print("[warn] ffmpeg 不可用，跳过压缩（可能触发代理或 Bot 限制）")
+        return input_path
+
+    out_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", FFMPEG_SCALE,
+        "-b:v", FFMPEG_VIDEO_BR,
+        "-b:a", FFMPEG_AUDIO_BR,
+        out_path,
+    ]
+    try:
+        print(f"[info] compressing via ffmpeg: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        new_mb = os.path.getsize(out_path) / (1024 * 1024)
+        print(f"[info] compressed size = {new_mb:.1f} MB")
+        return out_path
+    except Exception as e:
+        print(f"[warn] ffmpeg 压缩失败，继续使用原文件；err={e}")
+        return input_path
 
 # ===== 健康检查 =====
 @app.get("/")
 def root():
     return {"ok": True}
-
 
 # ===== LINE Webhook =====
 @app.post("/webhook", response_class=PlainTextResponse)
@@ -98,65 +196,92 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
             if isinstance(event.message, VideoMessage):
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, FileMessage):
-                # 要求「文件也按影片发送」
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, TextMessage):
                 if event.message.text.strip().lower() == "ping":
                     await tg_send_text("pong from LINE webhook (bot mode)")
     return "OK"
 
-
+# ===== 主处理：下载 -> 去重 -> 压缩(可选) -> 限速 -> 发送（带重试）=====
 async def handle_binary_message(message_id: str):
-    """
-    从 LINE 下载 -> 写入临时文件（按 Content-Type 选扩展名）
-    -> 读取宽高 -> 使用 Bot API 以 send_video 发送到频道/超级群（支持 ≤2GB）。
-    caption 仅放 BTN_URL（若为空则不带 caption）。
-    """
     start = time.time()
 
-    # 1) 下载 LINE 媒体并获取 Content-Type（流式）
+    # 1) 下载 LINE 媒体
     content = line_bot_api.get_message_content(message_id)
     content_type = ""
     try:
         content_type = content.headers.get("Content-Type", "")
     except Exception:
         pass
-
     suffix = _ext_from_content_type(content_type)
 
-    # 2) 写入临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
         for chunk in content.iter_content():
             if chunk:
                 tmp.write(chunk)
 
-    # 3) 读取视频宽高（可选，用于避免客户端显示成正方形）
-    width, height = _probe_dims(tmp_path)
-
-    # 4) 发送视频（Bot API，不需要 API_ID/API_HASH）
-    try:
-        with open(tmp_path, "rb") as f:
-            await bot.send_video(
-                chat_id=TG_TARGET,
-                video=f,
-                caption=BTN_URL or None,
-                supports_streaming=True,
-                width=width or None,
-                height=height or None,
-            )
-    except NetworkError as e:
-        # 413: Request Entity Too Large（文件超过限制）等网络层错误
-        raise RuntimeError(f"❌ Telegram NetworkError：{e}")
-    except (Forbidden, BadRequest) as e:
-        # 典型：Bot 不是管理员 / chat_id 不对 / 频道私有等
-        raise RuntimeError(f"❌ Telegram 权限/参数错误：{e}")
-    finally:
-        # 5) 清理
+    # 2) 去重
+    sha1 = _sha1_sample(tmp_path, HASH_SAMPLE_MB)
+    if _dedup_hit(sha1):
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+        print(f"⤴ skip duplicate (sha1={sha1[:10]}...)  from LINE msg {message_id}")
+        return
+    _dedup_mark(sha1)
+
+    # 3) 可选压缩（解决 80MB 被代理拦截/返回 413 的情况）
+    send_path = _maybe_compress(tmp_path)
+
+    # 4) 读取视频宽高
+    width, height = _probe_dims(send_path)
+
+    # 5) 限速（串行 + 最小间隔 + 每小时上限）
+    await _respect_rate_limits()
+
+    # 6) 发送（带退避重试）
+    attempt = 0
+    backoff = 2.0
+    try:
+        while True:
+            attempt += 1
+            try:
+                with open(send_path, "rb") as f:
+                    await bot.send_video(
+                        chat_id=TG_TARGET,
+                        video=f,                           # 传文件句柄，避免一次性读入内存
+                        caption=BTN_URL or None,
+                        supports_streaming=True,
+                        width=width or None,
+                        height=height or None,
+                    )
+                break  # 成功
+            except RetryAfter as e:
+                # Telegram 明确要求等待 e.retry_after 秒
+                wait = float(getattr(e, "retry_after", 5))
+                print(f"[warn] RetryAfter {wait}s")
+                await asyncio.sleep(wait + random.uniform(0, 2))
+            except (NetworkError, TimedOut) as e:
+                if attempt >= MAX_RETRIES:
+                    raise RuntimeError(f"❌ 网络错误，已重试 {attempt} 次仍失败：{e!r}")
+                print(f"[warn] network error ({e!r}), backoff {backoff}s")
+                await asyncio.sleep(backoff + random.uniform(0, 2))
+                backoff = min(backoff * 2, 60)
+            except (Forbidden, BadRequest) as e:
+                raise RuntimeError(f"❌ 权限/参数错误：{e!r}")
+    finally:
+        # 7) 清理临时文件（原始与压缩）
+        for p in {tmp_path, send_path}:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
     cost = time.time() - start
-    print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', suffix='{suffix}', caption={'on' if BTN_URL else 'off'}")
+    print(
+        f"✔ synced video: {width}x{height}, {cost:.1f}s, "
+        f"ctype='{content_type}', caption={'on' if BTN_URL else 'off'}"
+    )
