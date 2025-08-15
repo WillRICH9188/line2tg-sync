@@ -7,3 +7,4 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
+python-telegram-bot==21.6
