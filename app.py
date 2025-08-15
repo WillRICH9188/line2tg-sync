@@ -1,6 +1,9 @@
+# app.py  —— LINE 群视频同步到 Telegram 频道（Bot 版本）
+
 import os
 import tempfile
 import time
+import asyncio
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -8,49 +11,35 @@ from fastapi.responses import PlainTextResponse
 from linebot import LineBotApi, WebhookParser
 from linebot.models import MessageEvent, VideoMessage, FileMessage, TextMessage
 
-# ----- LINE 环境变量 -----
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+# ===== 环境变量 =====
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 
-# ----- Telegram（用户账号 MTProto）环境变量 -----
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-TELEGRAM_STRING_SESSION = os.environ.get("TELEGRAM_STRING_SESSION", "")
-TG_TARGET = os.environ.get("TG_TARGET", "")  # @username 或 -100xxxxxxxxxx
+# 仅需 Bot 凭证 & 目标频道
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # @channel_username 或 -100xxxxxxxxxx
 
-# 可选：在视频下方显示的网址（作为 caption）
+# 可选：视频下方显示的网址（caption）
 BTN_URL = os.environ.get("BTN_URL", "").strip()
 
-if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and API_ID and API_HASH and TELEGRAM_STRING_SESSION and TG_TARGET):
-    raise RuntimeError("❌ 必填环境变量缺失：LINE/Telegram(MTProto) 相关配置未填全")
+if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and BOT_TOKEN and TG_TARGET):
+    raise RuntimeError("❌ 必填环境变量缺失：请设置 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / BOT_TOKEN / TG_TARGET")
 
-# LINE SDK
+# ===== 初始化 SDK =====
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 
-# Pyrogram 用户客户端（MTProto）
-from pyrogram import Client
-
-tg = Client(
-    name="line2tg",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=TELEGRAM_STRING_SESSION,
-)
+# Telegram Bot（python-telegram-bot 21.x，为异步接口）
+from telegram import Bot
+bot = Bot(BOT_TOKEN)
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def _startup():
-    await tg.start()
 
-@app.on_event("shutdown")
-async def _shutdown():
-    await tg.stop()
-
-# （可选）发送普通文本（用户账号）
+# （可选）发送纯文本到频道
 async def tg_send_text(text: str):
-    await tg.send_message(chat_id=TG_TARGET, text=text)
+    await bot.send_message(chat_id=TG_TARGET, text=text)
+
 
 # ---- 工具函数 ----
 def _ext_from_content_type(ct: str) -> str:
@@ -68,6 +57,7 @@ def _ext_from_content_type(ct: str) -> str:
         return ".webm"
     return ".mp4"
 
+
 def _probe_dims(path: str):
     """用 OpenCV 读取视频宽高，失败则返回 (None, None)"""
     try:
@@ -82,7 +72,14 @@ def _probe_dims(path: str):
         pass
     return None, None
 
-# ----- LINE Webhook -----
+
+# ===== 健康检查 =====
+@app.get("/")
+def root():
+    return {"ok": True}
+
+
+# ===== LINE Webhook =====
 @app.post("/webhook", response_class=PlainTextResponse)
 async def webhook(request: Request, x_line_signature: str = Header(None, alias="X-Line-Signature")):
     body = await request.body()
@@ -99,22 +96,23 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
             if isinstance(event.message, VideoMessage):
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, FileMessage):
-                # 你要求「全部当影片发送」，文件也按影片尝试发送
+                # 你要求「文件也按影片发送」
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, TextMessage):
                 if event.message.text.strip().lower() == "ping":
-                    await tg_send_text("pong from LINE webhook")
+                    await tg_send_text("pong from LINE webhook (bot mode)")
     return "OK"
+
 
 async def handle_binary_message(message_id: str):
     """
-    从 LINE 下载内容 -> 保存到临时文件（按 Content-Type 选择扩展名）
-    -> 读取宽高 -> 以 send_video 发送并显式指定 width/height（避免手机端显示成正方形）。
+    从 LINE 下载 -> 写入临时文件（按 Content-Type 选扩展名）
+    -> 读取宽高 -> 使用 Bot API 以 send_video 发送到频道（支持 ≤2GB）。
     caption 仅放 BTN_URL（若为空则不带 caption）。
     """
     start = time.time()
 
-    # 1) 下载 LINE 媒体并获取 Content-Type
+    # 1) 下载 LINE 媒体并获取 Content-Type（流式）
     content = line_bot_api.get_message_content(message_id)
     content_type = ""
     try:
@@ -131,34 +129,26 @@ async def handle_binary_message(message_id: str):
             if chunk:
                 tmp.write(chunk)
 
-    # 3) 读取视频宽高
+    # 3) 读取视频宽高（可选，用于避免客户端显示成正方形）
     width, height = _probe_dims(tmp_path)
 
-    # 4) 组织参数，caption 只放 URL
-    send_kwargs = {
-        "chat_id": TG_TARGET,
-        "video": tmp_path,
-        "supports_streaming": True,
-    }
-    if BTN_URL:
-        send_kwargs["caption"] = BTN_URL
-    if width and height:
-        send_kwargs["width"] = width
-        send_kwargs["height"] = height
-
-    # 5) 发送视频
-    await tg.send_video(**send_kwargs)
-
-    # 6) 清理
+    # 4) 发送视频（Bot API，不需要 API_ID/API_HASH）
     try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+        with open(tmp_path, "rb") as f:
+            await bot.send_video(
+                chat_id=TG_TARGET,
+                video=f,
+                caption=BTN_URL or None,
+                supports_streaming=True,
+                width=width or None,
+                height=height or None,
+            )
+    finally:
+        # 5) 清理
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
     cost = time.time() - start
     print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', suffix='{suffix}', caption={'on' if BTN_URL else 'off'}")
-
-# 健康检查
-@app.get("/")
-def root():
-    return {"ok": True}
