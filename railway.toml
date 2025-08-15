@@ -1,3 +1,2 @@
-# railway.toml —— 让 Nixpacks 在镜像里安装 ffmpeg
 [nixpacks]
 packages = ["ffmpeg"]
