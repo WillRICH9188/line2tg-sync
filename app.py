@@ -14,21 +14,22 @@ from fastapi.responses import PlainTextResponse
 from linebot import LineBotApi, WebhookParser
 from linebot.models import MessageEvent, VideoMessage, FileMessage, TextMessage
 
-# ===== 环境变量 =====
+# ===== 基础环境变量 =====
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # 推荐 -100xxxxxxxxxx
+TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # 强烈建议使用 -100xxxxxxxxxx
 
+# 可选：视频下方显示的网址（caption）
 BTN_URL = os.environ.get("BTN_URL", "").strip()
 
-# 可调风控参数（秒、条）
-GLOBAL_MIN_INTERVAL = float(os.environ.get("GLOBAL_MIN_INTERVAL", "8"))   # 两条视频最少间隔秒
-PER_HOUR_LIMIT = int(os.environ.get("PER_HOUR_LIMIT", "120"))             # 每小时上限
-DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))     # 去重缓存有效期（默认1天）
-HASH_SAMPLE_MB = int(os.environ.get("HASH_SAMPLE_MB", "5"))               # 采样前N MB做哈希
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))                     # 失败重试上限
+# ===== 防风控可调参数（可用环境变量覆盖）=====
+GLOBAL_MIN_INTERVAL = float(os.environ.get("GLOBAL_MIN_INTERVAL", "8"))   # 两条视频最少间隔（秒）
+PER_HOUR_LIMIT      = int(os.environ.get("PER_HOUR_LIMIT", "120"))        # 每小时最多条数
+DEDUP_TTL_SECONDS   = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))   # 去重缓存有效期，默认1天
+HASH_SAMPLE_MB      = int(os.environ.get("HASH_SAMPLE_MB", "5"))          # 用前N MB采样做哈希
+MAX_RETRIES         = int(os.environ.get("MAX_RETRIES", "3"))             # 发送失败最大重试次数
 
 if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and BOT_TOKEN and TG_TARGET):
     raise RuntimeError("❌ 必填环境变量缺失：请设置 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / BOT_TOKEN / TG_TARGET")
@@ -37,7 +38,7 @@ if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and BOT_TOKEN and TG_T
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 
-# Telegram Bot（python-telegram-bot 21.x）
+# Telegram Bot（python-telegram-bot 21.x，为异步接口）
 from telegram import Bot
 from telegram.error import NetworkError, Forbidden, BadRequest, RetryAfter, TimedOut
 
@@ -46,31 +47,29 @@ bot = Bot(BOT_TOKEN)
 app = FastAPI()
 
 # ===== 速率控制 / 去重状态 =====
-SEND_LOCK = asyncio.Lock()
+SEND_LOCK = asyncio.Lock()   # 串行发送大文件，避免并发
 LAST_SEND_TS = 0.0
-SEND_WINDOW = deque()  # 最近1小时的发送时间戳
-DEDUP_CACHE = {}       # sha1 -> ts
+SEND_WINDOW = deque()        # 最近1小时的发送时间戳
+DEDUP_CACHE = {}             # sha1 -> ts（去重）
 
-# （可选）发送纯文本
+# ===== 工具函数 =====
 async def tg_send_text(text: str):
+    """可选：发送纯文本到频道/群"""
     await bot.send_message(chat_id=TG_TARGET, text=text)
 
-# ---- 工具函数 ----
 def _ext_from_content_type(ct: str) -> str:
+    """根据 Content-Type 猜扩展名"""
     if not ct:
         return ".mp4"
     ct = ct.lower()
-    if "video/mp4" in ct:
-        return ".mp4"
-    if "video/quicktime" in ct or "/mov" in ct:
-        return ".mov"
-    if "video/x-matroska" in ct or "mkv" in ct:
-        return ".mkv"
-    if "video/webm" in ct:
-        return ".webm"
+    if "video/mp4" in ct: return ".mp4"
+    if "video/quicktime" in ct or "/mov" in ct: return ".mov"
+    if "video/x-matroska" in ct or "mkv" in ct: return ".mkv"
+    if "video/webm" in ct: return ".webm"
     return ".mp4"
 
 def _probe_dims(path: str):
+    """读取视频宽高，失败返回 (None, None)"""
     try:
         import cv2
         cap = cv2.VideoCapture(path)
@@ -84,26 +83,24 @@ def _probe_dims(path: str):
     return None, None
 
 def _sha1_sample(path: str, sample_mb: int) -> str:
-    """对前 sample_mb MB 数据做 sha1，足以做短期去重"""
+    """对前 sample_mb MB 做 sha1，用于短期去重"""
     h = hashlib.sha1()
-    bytes_to_read = sample_mb * 1024 * 1024
+    remain = sample_mb * 1024 * 1024
     with open(path, "rb") as f:
-        while bytes_to_read > 0:
-            chunk = f.read(min(1024 * 1024, bytes_to_read))
+        while remain > 0:
+            chunk = f.read(min(1024 * 1024, remain))
             if not chunk:
                 break
             h.update(chunk)
-            bytes_to_read -= len(chunk)
+            remain -= len(chunk)
     return h.hexdigest()
 
 def _dedup_hit(sha1: str) -> bool:
     """检查/清理去重缓存"""
     now = time.time()
-    # 清理过期
-    expired = [k for k, ts in DEDUP_CACHE.items() if now - ts > DEDUP_TTL_SECONDS]
-    for k in expired:
-        DEDUP_CACHE.pop(k, None)
-    # 命中？
+    for k, ts in list(DEDUP_CACHE.items()):
+        if now - ts > DEDUP_TTL_SECONDS:
+            DEDUP_CACHE.pop(k, None)
     return sha1 in DEDUP_CACHE
 
 def _dedup_mark(sha1: str):
@@ -112,29 +109,28 @@ def _dedup_mark(sha1: str):
 def _prune_window():
     """维护1小时滚动窗口"""
     now = time.time()
-    one_hour_ago = now - 3600
-    while SEND_WINDOW and SEND_WINDOW[0] < one_hour_ago:
+    threshold = now - 3600
+    while SEND_WINDOW and SEND_WINDOW[0] < threshold:
         SEND_WINDOW.popleft()
 
 async def _respect_rate_limits():
     """全局限速 + 每小时上限 + 抖动"""
     global LAST_SEND_TS
     async with SEND_LOCK:
-        # 1) 最小间隔
+        # 最小间隔
         now = time.time()
         wait = LAST_SEND_TS + GLOBAL_MIN_INTERVAL - now
         if wait > 0:
-            await asyncio.sleep(wait + random.uniform(0, 2))  # 抖动
+            await asyncio.sleep(wait + random.uniform(0, 2))  # 抖动 0~2s
 
-        # 2) 每小时上限
+        # 每小时上限
         _prune_window()
         if len(SEND_WINDOW) >= PER_HOUR_LIMIT:
-            # 等到窗口最早一个发送点 +3600 到来
             sleep_sec = SEND_WINDOW[0] + 3600 - time.time()
             if sleep_sec > 0:
                 await asyncio.sleep(sleep_sec + random.uniform(0, 2))
 
-        # 更新时间戳与窗口（占位）
+        # 占位记录
         LAST_SEND_TS = time.time()
         SEND_WINDOW.append(LAST_SEND_TS)
 
@@ -160,17 +156,15 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
             if isinstance(event.message, VideoMessage):
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, FileMessage):
+                # 文件也按视频发送
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, TextMessage):
                 if event.message.text.strip().lower() == "ping":
                     await tg_send_text("pong from LINE webhook (bot mode)")
     return "OK"
 
+# ===== 主处理：下载 -> 去重 -> 限速 -> 发送（带重试）=====
 async def handle_binary_message(message_id: str):
-    """
-    从 LINE 下载 -> 保存临时文件 -> 读取宽高
-    -> 去重检查 -> 限速/重试发送到 Telegram 频道/超级群（≤2GB）
-    """
     start = time.time()
 
     # 1) 下载 LINE 媒体
@@ -188,14 +182,14 @@ async def handle_binary_message(message_id: str):
             if chunk:
                 tmp.write(chunk)
 
-    # 2) 去重（采样哈希）
+    # 2) 去重
     sha1 = _sha1_sample(tmp_path, HASH_SAMPLE_MB)
     if _dedup_hit(sha1):
         try:
             os.remove(tmp_path)
         except Exception:
             pass
-        print(f"⤴ skip duplicate (sha1={sha1[:10]}...), from LINE msg {message_id}")
+        print(f"⤴ skip duplicate (sha1={sha1[:10]}...)  from LINE msg {message_id}")
         return
     _dedup_mark(sha1)
 
@@ -226,17 +220,23 @@ async def handle_binary_message(message_id: str):
                 # Telegram 明确要求等待 e.retry_after 秒
                 await asyncio.sleep(float(getattr(e, "retry_after", 5)) + random.uniform(0, 2))
             except (NetworkError, TimedOut) as e:
+                # 网络层错误：指数退避重试
                 if attempt >= MAX_RETRIES:
-                    raise RuntimeError(f"❌ 网络错误已重试 {attempt} 次仍失败：{e}")
+                    raise RuntimeError(f"❌ 网络错误，已重试 {attempt} 次仍失败：{e}")
                 await asyncio.sleep(backoff + random.uniform(0, 2))
-                backoff = min(backoff * 2, 60)  # 指数退避，封顶 60s
+                backoff = min(backoff * 2, 60)
             except (Forbidden, BadRequest) as e:
+                # 权限/参数问题：直接报错（如：bot 非管理员、chat_id 不正确、频道私有等）
                 raise RuntimeError(f"❌ 权限/参数错误：{e}")
     finally:
+        # 6) 清理临时文件
         try:
             os.remove(tmp_path)
         except Exception:
             pass
 
     cost = time.time() - start
-    print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', caption={'on' if BTN_URL else 'off'}")
+    print(
+        f"✔ synced video: {width}x{height}, {cost:.1f}s, "
+        f"ctype='{content_type}', caption={'on' if BTN_URL else 'off'}"
+    )
