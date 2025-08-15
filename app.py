@@ -1,4 +1,4 @@
-# app.py  —— LINE 群视频同步到 Telegram 频道（Bot 版本）
+# app.py —— LINE 群视频同步到 Telegram 频道（Bot 版本，支持 ≤2GB）
 
 import os
 import tempfile
@@ -15,9 +15,9 @@ from linebot.models import MessageEvent, VideoMessage, FileMessage, TextMessage
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 
-# 仅需 Bot 凭证 & 目标频道
+# 仅需 Bot 凭证 & 目标频道/超级群
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # @channel_username 或 -100xxxxxxxxxx
+TG_TARGET = os.environ.get("TG_TARGET", "").strip()  # 推荐用 -100xxxxxxxxxx
 
 # 可选：视频下方显示的网址（caption）
 BTN_URL = os.environ.get("BTN_URL", "").strip()
@@ -31,6 +31,8 @@ parser = WebhookParser(LINE_CHANNEL_SECRET)
 
 # Telegram Bot（python-telegram-bot 21.x，为异步接口）
 from telegram import Bot
+from telegram.error import NetworkError, Forbidden, BadRequest
+
 bot = Bot(BOT_TOKEN)
 
 app = FastAPI()
@@ -96,7 +98,7 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
             if isinstance(event.message, VideoMessage):
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, FileMessage):
-                # 你要求「文件也按影片发送」
+                # 要求「文件也按影片发送」
                 await handle_binary_message(event.message.id)
             elif isinstance(event.message, TextMessage):
                 if event.message.text.strip().lower() == "ping":
@@ -107,7 +109,7 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
 async def handle_binary_message(message_id: str):
     """
     从 LINE 下载 -> 写入临时文件（按 Content-Type 选扩展名）
-    -> 读取宽高 -> 使用 Bot API 以 send_video 发送到频道（支持 ≤2GB）。
+    -> 读取宽高 -> 使用 Bot API 以 send_video 发送到频道/超级群（支持 ≤2GB）。
     caption 仅放 BTN_URL（若为空则不带 caption）。
     """
     start = time.time()
@@ -143,6 +145,12 @@ async def handle_binary_message(message_id: str):
                 width=width or None,
                 height=height or None,
             )
+    except NetworkError as e:
+        # 413: Request Entity Too Large（文件超过限制）等网络层错误
+        raise RuntimeError(f"❌ Telegram NetworkError：{e}")
+    except (Forbidden, BadRequest) as e:
+        # 典型：Bot 不是管理员 / chat_id 不对 / 频道私有等
+        raise RuntimeError(f"❌ Telegram 权限/参数错误：{e}")
     finally:
         # 5) 清理
         try:
@@ -152,5 +160,3 @@ async def handle_binary_message(message_id: str):
 
     cost = time.time() - start
     print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', suffix='{suffix}', caption={'on' if BTN_URL else 'off'}")
-
-
