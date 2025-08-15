@@ -1,2 +1,7 @@
 [nixpacks]
 packages = ["ffmpeg"]
+[build]
+nixpacksPkgs = ["ffmpeg"]
+
+[meta]
+force_rebuild = "2025-08-16"
