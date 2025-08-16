@@ -1,6 +1,6 @@
 # app.py —— LINE 群视频同步到 Telegram 频道（Bot 版）
-# 功能：强制压缩到 ~47–48MB + 限速 + 每小时上限 + 抖动 + 重试 + 去重（保持比例不变）
-# 依赖：ffmpeg; python-telegram-bot 21.x, fastapi, line-bot-sdk, uvicorn
+# 功能：强制压缩到 ~47–48MB + 限速 + 每小时上限 + 抖动 + 重试 + 去重（保持比例不变）+ 发送队列（串行/小并发）
+# 依赖：ffmpeg; python-telegram-bot 21.x, fastapi, line-bot-sdk, uvicorn, opencv-python-headless
 
 import os
 import tempfile
@@ -31,10 +31,10 @@ if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN and BOT_TOKEN and TG_T
 BTN_URL = os.environ.get("BTN_URL", "").strip()
 
 # —— 压缩相关（确保 ≤50MB，默认目标 47.5MB，保留安全余量）——
-TARGET_MB = float(os.getenv("TG_TARGET_MB", "47.5"))   # 最终目标大小（MB）
-AUDIO_KBPS = int(os.getenv("TG_AUDIO_KBPS", "64"))     # 音频码率（kbps）
-SCALE_WIDTH = int(os.getenv("TG_SCALE_W", "720"))      # 最大宽度（保持比例），可改 640 更狠
-TARGET_FPS = int(os.getenv("TG_FPS", "24"))            # 降帧（24 基本不影响观看）
+TARGET_MB  = float(os.getenv("TG_TARGET_MB", "47.5"))   # 最终目标大小（MB）
+AUDIO_KBPS = int(os.getenv("TG_AUDIO_KBPS", "64"))      # 音频码率（kbps）
+SCALE_WIDTH = int(os.getenv("TG_SCALE_W", "720"))       # 最大宽度（保持比例），可改 640 更狠
+TARGET_FPS = int(os.getenv("TG_FPS", "24"))             # 降帧（24 基本不影响观看）
 
 # —— 防风控：限速 + 每小时上限 + 抖动 + 重试 —— 
 GLOBAL_MIN_INTERVAL = float(os.environ.get("GLOBAL_MIN_INTERVAL", "10"))  # 两次发送最小间隔（秒）
@@ -46,21 +46,36 @@ MAX_RETRIES         = int(os.environ.get("MAX_RETRIES", "3"))             # 失�
 DEDUP_TTL_SECONDS   = int(os.environ.get("DEDUP_TTL_SECONDS", "86400"))   # 去重缓存有效期（秒）
 HASH_SAMPLE_MB      = int(os.environ.get("HASH_SAMPLE_MB", "5"))          # 采样前 N MB 做哈希
 
+# —— 发送队列/worker 并发度（1 = 严格串行；2/3 = 小并发）——
+SEND_WORKERS = int(os.getenv("SEND_WORKERS", "1"))
+
 # ===== 初始化 SDK =====
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 
 from telegram import Bot
+from telegram.request import HTTPXRequest
 from telegram.error import NetworkError, Forbidden, BadRequest, RetryAfter, TimedOut
-bot = Bot(BOT_TOKEN)
+
+# 放大连接池 + 更宽松的超时，上传大视频更稳
+request = HTTPXRequest(
+    connection_pool_size=50,   # 默认太小，这里放大
+    pool_timeout=120,          # 等可用连接的时间
+    read_timeout=60 * 60,      # 读超时放到 1 小时
+    write_timeout=60 * 10,     # 写入超时
+    connect_timeout=60,        # 连接超时
+)
+bot = Bot(BOT_TOKEN, request=request)
 
 app = FastAPI()
 
-# ===== 状态（限速/上限/去重）=====
-SEND_LOCK = asyncio.Lock()      # 串行发送，避免并发
+# ===== 状态（限速/上限/去重/队列）=====
+SEND_LOCK = asyncio.Lock()      # 限速时的串行锁
 LAST_SEND_TS = 0.0
 SEND_WINDOW = deque()           # 最近一小时的发送时间戳
 DEDUP_CACHE = {}                # sha1 -> ts
+
+SEND_QUEUE: asyncio.Queue = asyncio.Queue()  # 发送任务队列
 
 # ========= 工具函数 =========
 
@@ -171,8 +186,10 @@ def _smart_compress(in_path: str) -> str:
                 "-c:a", "aac", "-b:a", f"{AUDIO_KBPS}k", "-ac", "1",
                 "-movflags", "+faststart", out2
             ])
-            try: os.remove(out_path)
-            except: pass
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
             out_path = out2
             out_mb = os.path.getsize(out_path) / (1024 * 1024)
             print(f"[compress] pass2 size = {out_mb:.1f} MB")
@@ -213,6 +230,56 @@ async def _respect_rate_limits():
         LAST_SEND_TS = time.time()
         SEND_WINDOW.append(LAST_SEND_TS)
 
+# ===== 发送 worker / 队列 =====
+async def _do_send(final_path: str, width, height):
+    """真正的发送逻辑（带限速与重试）。"""
+    await _respect_rate_limits()
+
+    attempt, backoff = 0, 2.0
+    while True:
+        attempt += 1
+        try:
+            with open(final_path, "rb") as f:
+                await bot.send_video(
+                    chat_id=TG_TARGET,
+                    video=f,  # 流式句柄，避免一次性读入内存
+                    caption=BTN_URL or None,
+                    supports_streaming=True,
+                    width=width or None,
+                    height=height or None,
+                )
+            break  # 成功
+        except RetryAfter as e:
+            wait = float(getattr(e, "retry_after", 5))
+            jitter = random.uniform(0, JITTER_MAX_SEC)
+            print(f"[retry] RetryAfter {wait}s + jitter {jitter:.1f}s")
+            await asyncio.sleep(wait + jitter)
+        except (NetworkError, TimedOut) as e:
+            if attempt >= MAX_RETRIES:
+                raise RuntimeError(f"❌ 网络错误，已重试 {attempt} 次仍失败：{e!r}")
+            print(f"[retry] network error {e!r}, backoff {backoff:.1f}s")
+            await asyncio.sleep(backoff + random.uniform(0, JITTER_MAX_SEC))
+            backoff = min(backoff * 2, 60)
+        except (Forbidden, BadRequest) as e:
+            raise RuntimeError(f"❌ 权限/参数错误：{e!r}")
+
+async def send_worker():
+    """固定工人数，从队列取任务顺序执行。"""
+    while True:
+        job = await SEND_QUEUE.get()
+        try:
+            await job()
+        except Exception as e:
+            print(f"[worker] job failed: {e!r}")
+        finally:
+            SEND_QUEUE.task_done()
+
+@app.on_event("startup")
+async def _start_workers():
+    for _ in range(max(1, SEND_WORKERS)):
+        asyncio.create_task(send_worker())
+    print(f"[startup] SEND_WORKERS = {max(1, SEND_WORKERS)}")
+
 # ===== 健康检查 =====
 @app.get("/")
 def root():
@@ -241,7 +308,7 @@ async def webhook(request: Request, x_line_signature: str = Header(None, alias="
                     await tg_send_text("pong from LINE webhook (bot mode)")
     return "OK"
 
-# ===== 主流程：下载 -> 去重 -> 压缩 -> 限速 -> 发送（带重试）=====
+# ===== 主流程：下载 -> 去重 -> 压缩 -> （排队）发送 =====
 async def handle_binary_message(message_id: str):
     start = time.time()
 
@@ -272,8 +339,10 @@ async def handle_binary_message(message_id: str):
     # 2) 去重（前 HASH_SAMPLE_MB MB 采样）
     sha1 = _sha1_sample(tmp_path, HASH_SAMPLE_MB)
     if _dedup_hit(sha1):
-        try: os.remove(tmp_path)
-        except: pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
         print(f"⤴ skip duplicate (sha1={sha1[:10]}...), LINE msg={message_id}")
         return
     _dedup_mark(sha1)
@@ -284,47 +353,22 @@ async def handle_binary_message(message_id: str):
     # 4) 探测宽高（可选，避免显示比例异常）
     width, height = _probe_dims(final_path)
 
-    # 5) 限速（最小间隔 + 每小时上限 + 抖动）
-    await _respect_rate_limits()
+    # 5) 投递到队列，由 worker 顺序上传（发送完再清理临时文件）
+    async def job():
+        try:
+            await _do_send(final_path, width, height)
+        finally:
+            for p in {tmp_path, final_path}:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
 
-    # 6) 发送（带退避重试）
-    attempt = 0
-    backoff = 2.0
-    try:
-        while True:
-            attempt += 1
-            try:
-                with open(final_path, "rb") as f:
-                    await bot.send_video(
-                        chat_id=TG_TARGET,
-                        video=f,  # 流式句柄，避免一次性读入内存
-                        caption=BTN_URL or None,
-                        supports_streaming=True,
-                        width=width or None,
-                        height=height or None,
-                    )
-                break  # 成功
-            except RetryAfter as e:
-                wait = float(getattr(e, "retry_after", 5))
-                jitter = random.uniform(0, JITTER_MAX_SEC)
-                print(f"[retry] RetryAfter {wait}s + jitter {jitter:.1f}s")
-                await asyncio.sleep(wait + jitter)
-            except (NetworkError, TimedOut) as e:
-                if attempt >= MAX_RETRIES:
-                    raise RuntimeError(f"❌ 网络错误，已重试 {attempt} 次仍失败：{e!r}")
-                print(f"[retry] network error {e!r}, backoff {backoff:.1f}s")
-                await asyncio.sleep(backoff + random.uniform(0, JITTER_MAX_SEC))
-                backoff = min(backoff * 2, 60)
-            except (Forbidden, BadRequest) as e:
-                raise RuntimeError(f"❌ 权限/参数错误：{e!r}")
-    finally:
-        # 7) 清理临时文件（原/压缩）
-        for p in {tmp_path, final_path}:
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+    await SEND_QUEUE.put(job)
 
     cost = time.time() - start
-    print(f"✔ synced video: {width}x{height}, {cost:.1f}s, ctype='{content_type}', target~{TARGET_MB}MB, caption={'on' if BTN_URL else 'off'}")
+    print(
+        f"✔ queued video: {width}x{height}, prep {cost:.1f}s, "
+        f"ctype='{content_type}', target~{TARGET_MB}MB, caption={'on' if BTN_URL else 'off'}"
+    )
